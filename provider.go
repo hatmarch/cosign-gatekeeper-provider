@@ -19,17 +19,26 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/x509"
+	"encoding/pem"
+	"os"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/externaldata"
 
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio"
 	"github.com/sigstore/cosign/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/pkg/cosign"
+	"github.com/sigstore/cosign/pkg/cosign/kubernetes"
 )
 
 const (
 	apiVersion = "externaldata.gatekeeper.sh/v1alpha1"
+	timeout = 30 * time.Second
 )
 
 func main() {
@@ -41,6 +50,35 @@ func main() {
 	}
 }
 
+func parsePems(b []byte) []*pem.Block {
+	p, rest := pem.Decode(b)
+	if p == nil {
+		return nil
+	}
+	pems := []*pem.Block{p}
+
+	if rest != nil {
+		return append(pems, parsePems(rest)...)
+	}
+	return pems
+}
+
+func Keys(cfg map[string][]byte) []*ecdsa.PublicKey {
+	keys := []*ecdsa.PublicKey{}
+
+	pems := parsePems(cfg["cosign.pub"])
+	for _, p := range pems {
+		// TODO check header
+		key, err := x509.ParsePKIXPublicKey(p.Bytes)
+		if err != nil {
+			panic(err)
+		}
+		keys = append(keys, key.(*ecdsa.PublicKey))
+	}
+	return keys
+}
+
+
 func validate(w http.ResponseWriter, req *http.Request) {
 	// only accept POST requests
 	if req.Method != http.MethodPost {
@@ -51,6 +89,8 @@ func validate(w http.ResponseWriter, req *http.Request) {
 	// read request body
 	requestBody, err := ioutil.ReadAll(req.Body)
 	if err != nil {
+		fmt.Println(err)
+
 		sendResponse(nil, fmt.Sprintf("unable to read request body: %v", err), w)
 		return
 	}
@@ -59,6 +99,8 @@ func validate(w http.ResponseWriter, req *http.Request) {
 	var providerRequest externaldata.ProviderRequest
 	err = json.Unmarshal(requestBody, &providerRequest)
 	if err != nil {
+		fmt.Println(err)
+
 		sendResponse(nil, fmt.Sprintf("unable to unmarshal request body: %v", err), w)
 		return
 	}
@@ -73,40 +115,60 @@ func validate(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// iterate over all keys
-	for _, key := range providerRequest.Request.Keys {
-		fmt.Println("verify signature for:", key)
-		ref, err := name.ParseReference(key)
-		if err != nil {
-			sendResponse(nil, fmt.Sprintf("ERROR (ParseReference(%q)): %v", key, err), w)
-			return
-		}
+	secretKeyRef := os.Getenv("SECRET_NAME")
+	cfg, err := kubernetes.GetKeyPairSecret(ctx, secretKeyRef)
+	if err != nil {
+		fmt.Println(err)
+		sendResponse(nil, "unable to get key pair secret", w)
+		return
+	}
 
-		checkedSignatures, bundleVerified, err := cosign.VerifyImageSignatures(ctx, ref, &cosign.CheckOpts{
-			RekorURL:           "https://rekor.sigstore.dev",
-			RegistryClientOpts: co,
-			RootCerts:          fulcio.GetRoots(),
-		})
+	for _, k := range Keys(cfg.Data) {
 
+		ecdsaVerifier, err := signature.LoadECDSAVerifier(k, crypto.SHA256)
 		if err != nil {
 			fmt.Println(err)
-			sendResponse(nil, fmt.Sprintf("VerifyImageSignatures: %v", err), w)
+			sendResponse(nil, "Unable to get verifier from key", w)
 			return
 		}
 
-		if bundleVerified {
-			fmt.Println("signature verified for:", key)
-			fmt.Printf("%d number of valid signatures found for %s, found signatures: %v\n", len(checkedSignatures), key, checkedSignatures)
-			results = append(results, externaldata.Item{
-				Key:   key,
-				Value: key + "_valid",
+		// iterate over all provider keys
+		for _, key := range providerRequest.Request.Keys {
+			fmt.Println("verify signature for:", key)
+			ref, err := name.ParseReference(key)
+			if err != nil {
+				sendResponse(nil, fmt.Sprintf("ERROR (ParseReference(%q)): %v", key, err), w)
+				return
+			}
+
+			checkedSignatures, bundleVerified, err := cosign.VerifyImageSignatures(ctx, ref, &cosign.CheckOpts{
+				RekorURL:           "https://rekor.sigstore.dev",
+				RegistryClientOpts: co,
+				RootCerts:          fulcio.GetRoots(),
+				SigVerifier:   ecdsaVerifier,
+				ClaimVerifier: cosign.SimpleClaimVerifier,
 			})
-		} else {
-			fmt.Printf("no valid signatures found for: %s\n", key)
-			results = append(results, externaldata.Item{
-				Key:   key,
-				Error: key + "_invalid",
-			})
+
+			if err != nil {
+				fmt.Println(err)
+				sendResponse(nil, fmt.Sprintf("VerifyImageSignatures: %v", err), w)
+				return
+			}
+
+			if bundleVerified {
+				fmt.Println("signature verified for:", key)
+				fmt.Printf("%d number of valid signatures found for %s, found signatures: %v\n", len(checkedSignatures), key, checkedSignatures)
+				results = append(results, externaldata.Item{
+					Key:   key,
+					Value: key + "_valid",
+				})
+			} else {
+				fmt.Printf("no valid signatures found for: %s\n", key)
+				results = append(results, externaldata.Item{
+					Key:   key,
+					Error: key + "_invalid",
+				})
+			}
 		}
 	}
 
